@@ -1,5 +1,3 @@
-cd C:\Users\shaya\Desktop\Phi-System\llama.cpp
-
 Set-Content README.md @"
 ## phi4-omni-llama.cpp
 
@@ -82,22 +80,3 @@ This fork:
   - `phi4-mm-omni.gguf`
 
 ---
-
-### 4. Build
-hell
-cd C:\Users\shaya\Desktop\Phi-System\llama.cpp
-
-mkdir build
-cd build
-
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . --config Release
-
-
-cd C:\Users\shaya\Desktop\Phi-System\llama.cpp\build\bin\Release
-
-.\llama-server.exe `
-  -m C:\Users\shaya\Desktop\Phi-System\phi4-mm-Q4_K_M.gguf `
-  --mmproj C:\Users\shaya\Desktop\Phi-System\phi4-mm-omni.gguf `
-  --port 8080 `
-  --host 0.0.0.0
