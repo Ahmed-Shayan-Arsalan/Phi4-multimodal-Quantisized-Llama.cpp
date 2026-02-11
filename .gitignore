@@ -138,3 +138,10 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+## Ignore CI/CD workflows
+.github/
+.gitlab-ci.yml
+.circleci/
+azure-pipelines.yml
+Jenkinsfile
