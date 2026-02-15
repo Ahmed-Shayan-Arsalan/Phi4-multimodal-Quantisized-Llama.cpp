@@ -190,15 +190,18 @@
 			<span class="sr-only">Stop</span>
 			<Square class="h-8 w-8 fill-destructive stroke-destructive" />
 		</Button>
-	{:else if shouldShowRecordButton}
-		<ChatFormActionRecord {disabled} {hasAudioModality} {isLoading} {isRecording} {onMicClick} />
 	{:else}
-		<ChatFormActionSubmit
-			canSend={canSend && hasModelSelected && isSelectedModelInCache}
-			{disabled}
-			{isLoading}
-			tooltipLabel={submitTooltip}
-			showErrorState={hasModelSelected && !isSelectedModelInCache}
-		/>
+		<div class="flex items-center gap-2">
+			{#if hasAudioModality}
+				<ChatFormActionRecord {disabled} {hasAudioModality} {isLoading} {isRecording} {onMicClick} />
+			{/if}
+			<ChatFormActionSubmit
+				canSend={canSend && hasModelSelected && isSelectedModelInCache}
+				{disabled}
+				{isLoading}
+				tooltipLabel={submitTooltip}
+				showErrorState={hasModelSelected && !isSelectedModelInCache}
+			/>
+		</div>
 	{/if}
 </div>

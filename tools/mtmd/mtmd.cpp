@@ -368,6 +368,12 @@ struct mtmd_context {
         } else if (proj == PROJECTOR_TYPE_MUSIC_FLAMINGO) {
             // <sound> ... (embeddings) ...
             aud_beg = "<sound>";
+
+        } else if (proj == PROJECTOR_TYPE_LFM2A) {
+            // <|audio_start|> ... (embeddings) ... <|audio_end|>
+            // Following the same pattern as LFM2 vision: <|image_start|> / <|image_end|>
+            aud_beg = "<|audio_start|>";
+            aud_end = "<|audio_end|>";
         }
     }
 

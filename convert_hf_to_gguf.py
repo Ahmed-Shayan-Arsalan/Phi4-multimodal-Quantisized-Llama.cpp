@@ -504,18 +504,29 @@ class ModelBase:
                 return False
         return name == (key_name + suffix)
 
-    def map_tensor_name(self, name: str, try_suffixes: Sequence[str] = (".weight", ".bias")) -> str:
-        new_name = self.tensor_map.get_name(key=name, try_suffixes=try_suffixes)
+    def map_tensor_name(self, name: str, try_suffixes: Sequence[str] = (".weight", ".bias")) -> str | None:
+        # Shayan's Fix: Remove the 'base_layer' and 'lora' noise so the script finds the core weights
+        clean_name = name.replace(".base_layer", "")
+
+        # If it's a LoRA tensor, we actually want to skip it for the F16 master
+        if ".lora_" in clean_name:
+            return None
+
+        new_name = self.tensor_map.get_name(key=clean_name, try_suffixes=try_suffixes)
         if new_name is None:
-            raise ValueError(f"Can not map tensor {name!r}")
+            print(f"Skipping truly unknown tensor: {name}")
+            return None
         return new_name
 
     def set_gguf_parameters(self):
         raise NotImplementedError("set_gguf_parameters() must be implemented in subclasses")
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        del bid # unused
-        return [(self.map_tensor_name(name), data_torch)]
+            del bid # unused
+            new_name = self.map_tensor_name(name)
+            if new_name is None:
+                return [] # Returning an empty list tells the script to ignore this tensor
+            return [(new_name, data_torch)]
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
         del name, new_name, bid, n_dims  # unused
@@ -1261,9 +1272,6 @@ class TextModel(ModelBase):
         if chkhsh == "6c81ce329e0802883b22eabab0d3fa48357337ef1ecb45443828bf1f6254833f":
             # ref: https://huggingface.co/LGAI-EXAONE/K-EXAONE-236B-A23B
             res = "exaone-moe"
-        if chkhsh == "d30d75d9059f1aa2c19359de71047b3ae408c70875e8a3ccf8c5fba56c9d8af4":
-            # ref: https://huggingface.co/Qwen/Qwen3.5-9B-Instruct
-            res = "qwen35"
 
         if res is None:
             logger.warning("\n")
@@ -1907,6 +1915,12 @@ class MmprojModel(ModelBase):
             self.fname_out = self.fname_out / f"mmproj-{fname_default}.gguf"
         else:
             self.fname_out = self.fname_out.parent / gguf.fill_templated_filename(self.fname_out.name, output_type)
+
+    def filter_tensors(self, name: str) -> bool:
+        # Accept Phi-4 vision/audio tensors and standard mm_projector tensors
+        return (name.startswith("model.embed_tokens_extend.image_embed") or 
+                name.startswith("model.embed_tokens_extend.audio_embed") or
+                name.startswith("model.mm_projector"))
 
     def set_gguf_parameters(self):
         self.gguf_writer.add_file_type(self.ftype)
@@ -4105,25 +4119,22 @@ class Qwen2MoeModel(TextModel):
         # process the experts separately
         name = name.replace("language_model.", "") # InternVL
 
-        # handle aggregated expert tensors
-        # GGUF stores dimensions reversed from PyTorch, so:
-        # PyTorch (A,B,C) -> GGUF writes [C,B,A] -> GGML reads ne={C,B,A}
-        # Input shapes from HF: (n_expert, n_ff_exp, n_embd) or (n_expert, n_embd, n_ff_exp)
-        # Expected GGML ne: {n_embd, n_ff_exp, n_expert} for gate/up, {n_ff_exp, n_embd, n_expert} for down
+        # handle pre-packed expert tensors (e.g. Qwen3.5 MoE, Qwen3Next)
+        # HF stores these using nn.Linear convention: [n_expert, out_features, in_features]
+        # This matches the individual expert stacking path below (which stacks
+        # per-expert [out, in] weights into [n_expert, out, in]), so no permute is needed.
         if name.endswith("mlp.experts.down_proj") or name.endswith("mlp.experts.down_proj.weight"):
             mapped = f"{name}.weight" if not name.endswith(".weight") else name
-            # HF: [n_expert, n_embd, n_ff] -> GGML: {n_ff, n_embd, n_expert}
+            # HF: [n_expert, n_embd, n_ff] → GGML: {n_ff, n_embd, n_expert} ✓
             yield from super().modify_tensors(data_torch, mapped, bid)
             return
 
         if name.endswith("mlp.experts.gate_up_proj") or name.endswith("mlp.experts.gate_up_proj.weight"):
-            if data_torch.ndim < 3 or data_torch.shape[-2] % 2 != 0:
-                raise ValueError(f"Unexpected gate_up_proj shape for {name}: {tuple(data_torch.shape)}")
-            # HF: [n_expert, 2*n_ff, n_embd] -> split on dim=-2
-            n_ff = data_torch.shape[-2] // 2
-            gate = data_torch[..., :n_ff, :].contiguous()
-            up = data_torch[..., n_ff:, :].contiguous()
-            # gate/up: [n_expert, n_ff, n_embd] -> GGML: {n_embd, n_ff, n_expert}
+            # HF: [n_expert, 2*n_ff, n_embd] → split on dim=1
+            n_ff = data_torch.shape[1] // 2
+            gate = data_torch[:, :n_ff, :].contiguous()
+            up = data_torch[:, n_ff:, :].contiguous()
+            # gate/up: [n_expert, n_ff, n_embd] → GGML: {n_embd, n_ff, n_expert} ✓
             base_name = name.removesuffix(".weight").removesuffix(".gate_up_proj")
             mapped_gate = f"{base_name}.gate_proj.weight"
             mapped_up = f"{base_name}.up_proj.weight"
@@ -4134,7 +4145,6 @@ class Qwen2MoeModel(TextModel):
         if name.startswith("mlp") or name.startswith("vision_model") or name.startswith("model.vision_tower") or name.startswith("model.multi_modal_projector") or name.startswith("model.visual"):
             # skip visual tensors
             return
-
         if name.find("experts") != -1:
             n_experts = self.hparams["num_experts"]
             assert bid is not None
@@ -4290,7 +4300,6 @@ class Qwen3NextModel(Qwen2MoeModel):
         self.gguf_writer.add_ssm_group_count(self.hparams["linear_num_key_heads"])
         self.gguf_writer.add_ssm_time_step_rank(self.hparams["linear_num_value_heads"])
         self.gguf_writer.add_ssm_inner_size(self.hparams["linear_value_head_dim"] * self.hparams["linear_num_value_heads"])
-        self.gguf_writer.add_full_attention_interval(self.hparams.get("full_attention_interval", 4))
         if (rope_dim := self.hparams.get("head_dim")) is None:
             rope_dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
         self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.hparams.get("partial_rotary_factor", 0.25)))
@@ -4340,6 +4349,40 @@ class Qwen3NextModel(Qwen2MoeModel):
             yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("Qwen3_5ForCausalLM", "Qwen3_5TextForCausalLM")
+class Qwen3_5Model(Qwen3NextModel):
+    model_arch = gguf.MODEL_ARCH.QWEN35
+
+    # Stores whichever of in_proj_a/in_proj_b is seen first, keyed by layer
+    _pending_ba: dict[int | None, tuple[str, Tensor]] = {}
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Handle split in_proj_b + in_proj_a → concatenated SSM_BETA_ALPHA
+        # safetensors sorts alphabetically so in_proj_a arrives before in_proj_b
+        if "in_proj_a.weight" in name or "in_proj_b.weight" in name:
+            which = "a" if "in_proj_a" in name else "b"
+            if bid not in self._pending_ba:
+                self._pending_ba[bid] = (which, data_torch)
+                return
+            prev_which, prev_tensor = self._pending_ba.pop(bid)
+            assert prev_which != which, f"duplicate in_proj_{which} for layer {bid}"
+            b_tensor = prev_tensor if prev_which == "b" else data_torch
+            a_tensor = prev_tensor if prev_which == "a" else data_torch
+            ba_combined = torch.cat([b_tensor, a_tensor], dim=0)
+            yield (self.format_tensor_name(gguf.MODEL_TENSOR.SSM_BETA_ALPHA, bid, ".weight"), ba_combined)
+            return
+        else:
+            # Qwen3Next uses .qkvz tensor, so we use the super to get the other functionalities
+            # (norm correction, A_log to A etc.) for free
+            # Qwen2Moe already does the gate_up conversion properly, just use that
+            yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("Qwen3_5MoeForCausalLM", "Qwen3_5MoeTextForCausalLM")
+class Qwen3_5MoeModel(Qwen3_5Model):
+    model_arch = gguf.MODEL_ARCH.QWEN35MOE
+
+
 @ModelBase.register("RND1")
 class RND1Model(Qwen2MoeModel):
     model_arch = gguf.MODEL_ARCH.RND1
@@ -4355,7 +4398,7 @@ class RND1Model(Qwen2MoeModel):
             self.gguf_writer.add_mask_token_id(mask_token_id)
 
 
-@ModelBase.register("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration", "Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration")
+@ModelBase.register("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration")
 class Qwen3VLVisionModel(MmprojModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -4399,10 +4442,6 @@ class Qwen3VLVisionModel(MmprojModel):
         assert self.hparams_vision is not None
         # Skip text model tensors - they go in the text model file
         if name.startswith("model.language_model.") or name.startswith("lm_head."):
-            return
-
-        # Skip MTP tensors
-        if name.startswith("mtp."):
             return
 
         if name.startswith("model.visual."):
@@ -4535,123 +4574,7 @@ class Qwen3VLMoeTextModel(Qwen3MoeModel):
         if name.startswith("model.visual."):
             return
 
-        # Qwen3VL has transposed packed tensors, so we treat it differently from general Qwen2MoE packed tensors
-        if name.endswith("mlp.experts.down_proj") or name.endswith("mlp.experts.down_proj.weight"):
-            name = name.replace("language_model.", "")
-            mapped = f"{name}.weight" if not name.endswith(".weight") else name
-            permuted = data_torch.permute(0, 2, 1).contiguous()
-            yield from ModelBase.modify_tensors(self, permuted, mapped, bid)
-            return
-
-        if name.endswith("mlp.experts.gate_up_proj") or name.endswith("mlp.experts.gate_up_proj.weight"):
-            name = name.replace("language_model.", "")
-            if data_torch.ndim < 3 or data_torch.shape[-1] % 2 != 0:
-                raise ValueError(f"Unexpected gate_up_proj shape for {name}: {tuple(data_torch.shape)}")
-            split_dim = data_torch.shape[-1] // 2
-            gate = data_torch[..., :split_dim].contiguous()
-            up = data_torch[..., split_dim:].contiguous()
-            # Input gate/up: (n_expert=128, n_embd=2048, n_ff_exp=768)
-            # Want GGML ne: {n_embd, n_ff_exp, n_expert} = {2048, 768, 128}
-            # Need PyTorch: (128, 768, 2048) [reversed of GGML]
-            # So: permute(0, 2, 1): (128, 2048, 768) -> (128, 768, 2048)
-            base_name = name.removesuffix(".weight")
-            base = base_name.rsplit('.', 1)[0]
-            mapped_gate = f"{base}.gate_proj.weight"
-            mapped_up = f"{base}.up_proj.weight"
-            perm_gate = gate.permute(0, 2, 1).contiguous()
-            perm_up = up.permute(0, 2, 1).contiguous()
-            yield from ModelBase.modify_tensors(self, perm_gate, mapped_gate, bid)
-            yield from ModelBase.modify_tensors(self, perm_up, mapped_up, bid)
-            return
-
         yield from super().modify_tensors(data_torch, name, bid)
-
-
-class _LinearAttentionVReorderBase(Qwen3NextModel):
-    model_arch = gguf.MODEL_ARCH.QWEN3NEXT  # overridden by subclasses
-    """reorders V heads from grouped to tiled order for ggml broadcast
-
-    see https://github.com/ggml-org/llama.cpp/pull/19468#discussion_r2786394306
-
-    Linear attention may has num_k_heads < num_v_heads. The HF weights store
-    V heads grouped by K head: [G0_v0..v{r-1}, G1_v0..v{r-1}, ...].
-    ggml binary ops use tiled broadcast: [K0, K1, ..., K0, K1, ...].
-    We reorder V heads to tiled order so ggml_repeat can replace the expensive
-    interleaved repeat: [G0_v0, G1_v0, ..., G0_v1, G1_v1, ...].
-    """
-
-    @staticmethod
-    def _reorder_v_heads(tensor: Tensor, dim: int, num_k_heads: int, num_v_per_k: int, head_dim: int) -> Tensor:
-        """Reorder V heads from grouped (by K head) to tiled order along the given dimension."""
-        shape = list(tensor.shape)
-        if dim < 0:
-            dim += len(shape)
-        new_shape = shape[:dim] + [num_k_heads, num_v_per_k, head_dim] + shape[dim + 1:]
-        tensor = tensor.reshape(*new_shape)
-        perm = list(range(len(new_shape)))
-        perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
-        return tensor.permute(*perm).contiguous().reshape(*shape)
-
-    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        num_k_heads = self.hparams.get("linear_num_key_heads", 0)
-        num_v_heads = self.hparams.get("linear_num_value_heads", 0)
-
-        if num_k_heads > 0 and num_v_heads > 0 and num_k_heads != num_v_heads and "linear_attn." in name:
-            head_k_dim = self.hparams["linear_key_head_dim"]
-            head_v_dim = self.hparams["linear_value_head_dim"]
-            num_v_per_k = num_v_heads // num_k_heads
-
-            if ".in_proj_qkv." in name:
-                # QKV weight: reorder only the V rows
-                q_dim = head_k_dim * num_k_heads
-                k_dim = head_k_dim * num_k_heads
-                q = data_torch[:q_dim]
-                k = data_torch[q_dim:q_dim + k_dim]
-                v = data_torch[q_dim + k_dim:]
-                v = self._reorder_v_heads(v, 0, num_k_heads, num_v_per_k, head_v_dim)
-                data_torch = torch.cat([q, k, v], dim=0)
-
-            elif ".in_proj_z." in name:
-                # Z gate weight: reorder rows (num_v_heads * head_v_dim)
-                data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, head_v_dim)
-
-            elif ".in_proj_b." in name or ".in_proj_a." in name:
-                # Beta/Alpha weight: reorder rows (num_v_heads, head_dim=1)
-                data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, 1)
-
-            elif ".A_log" in name or ".dt_bias" in name or ".dt_proj" in name:
-                # A_log / dt_bias: 1D parameters with num_v_heads elements
-                if data_torch.ndim == 1:
-                    data_torch = self._reorder_v_heads(
-                        data_torch.unsqueeze(-1), 0, num_k_heads, num_v_per_k, 1
-                    ).squeeze(-1)
-                else:
-                    data_torch = self._reorder_v_heads(data_torch, -1, num_k_heads, num_v_per_k, 1)
-
-            elif ".conv1d" in name:
-                # Conv1d kernel: reorder only the V channel portion
-                data = data_torch.squeeze()
-                qk_channels = head_k_dim * num_k_heads * 2
-                qk_part = data[:qk_channels]
-                v_part = data[qk_channels:]
-                v_part = self._reorder_v_heads(v_part, 0, num_k_heads, num_v_per_k, head_v_dim)
-                data_torch = torch.cat([qk_part, v_part], dim=0)
-
-            elif ".out_proj." in name:
-                # Out projection weight: reorder columns (input dimension)
-                data_torch = self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
-
-        yield from super().modify_tensors(data_torch, name, bid)
-
-
-@ModelBase.register("Qwen3_5ForConditionalGeneration")
-class Qwen3_5TextModel(_LinearAttentionVReorderBase):
-    model_arch = gguf.MODEL_ARCH.QWEN35
-
-
-@ModelBase.register("Qwen3_5MoeForConditionalGeneration")
-class Qwen3_5MoeTextModel(_LinearAttentionVReorderBase):
-    model_arch = gguf.MODEL_ARCH.QWEN35MOE
 
 
 @ModelBase.register("GPT2LMHeadModel")
@@ -4704,114 +4627,478 @@ class Phi2Model(TextModel):
 
 
 @ModelBase.register("Phi3ForCausalLM")
-class Phi3MiniModel(TextModel):
+class Phi3MiniModel(MmprojModel):  # Changed from TextModel to MmprojModel
     model_arch = gguf.MODEL_ARCH.PHI3
 
+    def get_vision_config(self) -> dict[str, Any] | None:
+        # Phi-4 doesn't have a standard vision_config, so extract from main config
+        # This is called by parent's __init__ after hparams is set
+        if not hasattr(self, 'hparams'):
+            return None
+            
+        # Check if we have vision-related configs (we know we do since we're filtering vision tensors)
+        # Always return a vision config if we're extracting vision tensors
+        img_embd = self.hparams.get("image_embd_layer", {})
+        
+        # Phi-4's image_embd_layer is a flat dict, not nested under "config"
+        # Extract values with reasonable defaults
+        vision_config = {
+            "hidden_size": 1152,   # Phi-4's actual vision hidden size
+            "intermediate_size": 4304,  # Phi-4's actual FFN intermediate size
+            "num_attention_heads": 16,   # 1152 / 72 = 16 heads
+            "num_hidden_layers": 27,     # 27 encoder layers
+            "image_size": img_embd.get("crop_size", 448) if isinstance(img_embd, dict) else 448,
+            "patch_size": 14,    # Phi-4 uses 14x14 patches, NOT 16!
+        }
+        
+        # If we have vision tensors, always return a config
+        return vision_config
+
+    def get_audio_config(self) -> dict[str, Any] | None:
+        """Extract Phi-4 audio encoder configuration."""
+        if not hasattr(self, 'hparams'):
+            return None
+        
+        audio_proc = self.hparams.get("audio_processor", {})
+        if not isinstance(audio_proc, dict):
+            return None
+        
+        audio_config = audio_proc.get("config", {})
+        if not isinstance(audio_config, dict):
+            return None
+        
+        # Extract audio encoder parameters
+        audio_embd = self.hparams.get("embd_layer", {}).get("audio_embd_layer", {})
+        
+        return {
+            "hidden_size": audio_config.get("attention_dim", 1024),
+            "num_attention_heads": audio_config.get("attention_heads", 16),
+            "num_hidden_layers": audio_config.get("num_blocks", 24),
+            "intermediate_size": audio_config.get("linear_units", 1536),
+            "num_mel_bins": audio_config.get("input_size", 80),
+            "compression_rate": audio_embd.get("compression_rate", 8),
+            "downsample_rate": audio_embd.get("downsample_rate", 1),
+            "time_reduction": audio_config.get("time_reduction", 8),
+        }
+
+    def __init__(self, *args, **kwargs):
+        # Temporarily override model_arch to pass MmprojModel's check
+        original_arch = Phi3MiniModel.model_arch
+        Phi3MiniModel.model_arch = gguf.MODEL_ARCH.MMPROJ
+        
+        try:
+            super().__init__(*args, **kwargs)
+            self._pos_bias_emitted = False  # For synthetic pos_bias_u/v in audio Conformer
+            # Ensure rope_parameters is initialized (in case MmprojModel doesn't set it)
+            if not hasattr(self, 'rope_parameters'):
+                self.rope_parameters = self.hparams.get("rope_parameters", self.hparams.get("rope_scaling")) or {}
+                rope_theta = self.find_hparam(["global_rope_theta", "rope_global_theta", "rope_theta_global", "rope_theta", "rotary_emb_base"], optional=True)
+                if "rope_theta" not in self.rope_parameters and rope_theta is not None:
+                    self.rope_parameters["rope_theta"] = rope_theta
+        finally:
+            # Restore original architecture
+            Phi3MiniModel.model_arch = original_arch
+            # Also set it on the instance
+            self.model_arch = original_arch
+
     def set_vocab(self):
-        # Phi-4 model uses GPT2Tokenizer
-        tokenizer_config_file = self.dir_model / 'tokenizer_config.json'
-        if tokenizer_config_file.is_file():
-            with open(tokenizer_config_file, "r", encoding="utf-8") as f:
-                tokenizer_config_json = json.load(f)
-                tokenizer_class = tokenizer_config_json['tokenizer_class']
-                if tokenizer_class == 'GPT2Tokenizer':
-                    return self._set_vocab_gpt2()
-
-        from sentencepiece import SentencePieceProcessor
-
-        tokenizer_path = self.dir_model / 'tokenizer.model'
-
-        if not tokenizer_path.is_file():
-            raise ValueError(f'Error: Missing {tokenizer_path}')
-
-        tokenizer = SentencePieceProcessor()
-        tokenizer.LoadFromFile(str(tokenizer_path))
-
-        vocab_size = self.hparams.get('vocab_size', tokenizer.vocab_size())
-
-        tokens: list[bytes] = [f"[PAD{i}]".encode("utf-8") for i in range(vocab_size)]
-        scores: list[float] = [-10000.0] * vocab_size
-        toktypes: list[int] = [SentencePieceTokenTypes.UNUSED] * vocab_size
-
-        for token_id in range(tokenizer.vocab_size()):
-
-            piece = tokenizer.IdToPiece(token_id)
-            text = piece.encode("utf-8")
-            score = tokenizer.GetScore(token_id)
-
-            toktype = SentencePieceTokenTypes.NORMAL
-            if tokenizer.IsUnknown(token_id):
-                toktype = SentencePieceTokenTypes.UNKNOWN
-            elif tokenizer.IsControl(token_id):
-                toktype = SentencePieceTokenTypes.CONTROL
-            elif tokenizer.IsUnused(token_id):
-                toktype = SentencePieceTokenTypes.UNUSED
-            elif tokenizer.IsByte(token_id):
-                toktype = SentencePieceTokenTypes.BYTE
-
-            tokens[token_id] = text
-            scores[token_id] = score
-            toktypes[token_id] = toktype
-
-        added_tokens_file = self.dir_model / 'added_tokens.json'
-        if added_tokens_file.is_file():
-            with open(added_tokens_file, "r", encoding="utf-8") as f:
-                added_tokens_json = json.load(f)
-
-                for key in added_tokens_json:
-                    token_id = added_tokens_json[key]
-                    if token_id >= vocab_size:
-                        logger.debug(f'ignore token {token_id}: id is out of range, max={vocab_size - 1}')
-                        continue
-
-                    tokens[token_id] = key.encode("utf-8")
-                    scores[token_id] = -1000.0
-                    toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
-
-        tokenizer_config_file = self.dir_model / 'tokenizer_config.json'
-        if tokenizer_config_file.is_file():
-            with open(tokenizer_config_file, "r", encoding="utf-8") as f:
-                tokenizer_config_json = json.load(f)
-                added_tokens_decoder = tokenizer_config_json.get("added_tokens_decoder", {})
-                for token_id, foken_data in added_tokens_decoder.items():
-                    token_id = int(token_id)
-                    token = foken_data["content"].encode("utf-8")
-                    if toktypes[token_id] != SentencePieceTokenTypes.UNUSED:
-                        if tokens[token_id] != token:
-                            logger.warning(f'replacing token {token_id}: {tokens[token_id].decode("utf-8")!r} -> {token.decode("utf-8")!r}')
-                    tokens[token_id] = token
-                    scores[token_id] = -1000.0
-                    toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
-                    if foken_data.get("special"):
-                        toktypes[token_id] = SentencePieceTokenTypes.CONTROL
-
+        # Shayan's Phi-4 Bypass: Using the modern JSON logic
         tokenizer_file = self.dir_model / 'tokenizer.json'
+
+        # Force the script to jump to the GPT2/Tiktoken logic
         if tokenizer_file.is_file():
-            with open(tokenizer_file, "r", encoding="utf-8") as f:
-                tokenizer_json = json.load(f)
-                added_tokens = tokenizer_json.get("added_tokens", [])
-                for foken_data in added_tokens:
-                    token_id = int(foken_data["id"])
-                    token = foken_data["content"].encode("utf-8")
-                    if toktypes[token_id] != SentencePieceTokenTypes.UNUSED:
-                        if tokens[token_id] != token:
-                            logger.warning(f'replacing token {token_id}: {tokens[token_id].decode("utf-8")!r} -> {token.decode("utf-8")!r}')
-                    tokens[token_id] = token
-                    scores[token_id] = -1000.0
-                    toktypes[token_id] = SentencePieceTokenTypes.USER_DEFINED
-                    if foken_data.get("special"):
-                        toktypes[token_id] = SentencePieceTokenTypes.CONTROL
+            print(f"Successfully located modern tokenizer: {tokenizer_file}")
+            return self._set_vocab_gpt2()
 
-        self.gguf_writer.add_tokenizer_model("llama")
-        self.gguf_writer.add_tokenizer_pre("default")
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_scores(scores)
-        self.gguf_writer.add_token_types(toktypes)
+        # Final safety check
+        raise ValueError(f"CRITICAL ERROR: Could not find tokenizer.json in {self.dir_model}")
 
-        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
-        special_vocab.add_to_gguf(self.gguf_writer)
+    def filter_tensors(self, name: str) -> bool:
+        # Shayan's Multimodal Filter: Include both vision and audio tensors
+        return (name.startswith("model.embed_tokens_extend.image_embed") or 
+                name.startswith("model.embed_tokens_extend.audio_embed"))
+
+    def _map_to_clip_tensor_name(self, name: str) -> str | None:
+        """Map Phi-4 vision tensor names to standard CLIP tensor names expected by llama.cpp."""
+        import re
+
+        # Strip .base_layer if present
+        name = name.replace(".base_layer", "")
+
+        # === Vision Encoder: img_processor.encoder.layers.{i}.* -> v.blk.{i}.* ===
+        prefix = "model.embed_tokens_extend.image_embed.img_processor."
+        if name.startswith(prefix):
+            suffix = name[len(prefix):]
+
+            # Patch embedding
+            if suffix == "embeddings.patch_embedding.weight":
+                return "v.patch_embd.weight"
+            if suffix == "embeddings.patch_embedding.bias":
+                return "v.patch_embd.bias"
+            # Position embedding
+            if suffix == "embeddings.position_embedding.weight":
+                return "v.position_embd.weight"
+            # Post layer norm - EXCLUDED: Phi-4 uses hidden_states[-2] (no post_layernorm)
+            if suffix.startswith("post_layernorm."):
+                return None  # Skip post_layernorm tensors
+
+            # Encoder layers: encoder.layers.{i}.*
+            m = re.match(r"encoder\.layers\.(\d+)\.(.*)", suffix)
+            if m:
+                i = int(m.group(1))
+                rest = m.group(2)
+                # Attention
+                if rest == "self_attn.q_proj.weight":  return f"v.blk.{i}.attn_q.weight"
+                if rest == "self_attn.q_proj.bias":    return f"v.blk.{i}.attn_q.bias"
+                if rest == "self_attn.k_proj.weight":  return f"v.blk.{i}.attn_k.weight"
+                if rest == "self_attn.k_proj.bias":    return f"v.blk.{i}.attn_k.bias"
+                if rest == "self_attn.v_proj.weight":  return f"v.blk.{i}.attn_v.weight"
+                if rest == "self_attn.v_proj.bias":    return f"v.blk.{i}.attn_v.bias"
+                if rest == "self_attn.out_proj.weight": return f"v.blk.{i}.attn_out.weight"
+                if rest == "self_attn.out_proj.bias":   return f"v.blk.{i}.attn_out.bias"
+                # Layer norms
+                if rest == "layer_norm1.weight": return f"v.blk.{i}.ln1.weight"
+                if rest == "layer_norm1.bias":   return f"v.blk.{i}.ln1.bias"
+                if rest == "layer_norm2.weight": return f"v.blk.{i}.ln2.weight"
+                if rest == "layer_norm2.bias":   return f"v.blk.{i}.ln2.bias"
+                # FFN: fc1 expands (1152→4304), fc2 compresses (4304→1152)
+                # Map fc1→ffn_up, fc2→ffn_down (correct semantic mapping)
+                # C++ swap won't trigger because ffn_down->ne[0]=4304 != n_embd=1152
+                if rest == "mlp.fc1.weight": return f"v.blk.{i}.ffn_up.weight"
+                if rest == "mlp.fc1.bias":   return f"v.blk.{i}.ffn_up.bias"
+                if rest == "mlp.fc2.weight": return f"v.blk.{i}.ffn_down.weight"
+                if rest == "mlp.fc2.bias":   return f"v.blk.{i}.ffn_down.bias"
+
+            # Head module (attention pooling) - store with custom names
+            if suffix.startswith("head."):
+                # These are Phi-specific, keep shortened names for potential future use
+                return f"v.head.{suffix[5:]}"
+
+            # Unknown img_processor tensor
+            print(f"Warning: unmapped img_processor tensor: {name}")
+            return None
+
+        # === MLP Projector: img_projection.{idx}.* -> mm.{idx}.* ===
+        prefix2 = "model.embed_tokens_extend.image_embed.img_projection."
+        if name.startswith(prefix2):
+            suffix = name[len(prefix2):]  # e.g. "0.weight", "2.bias"
+            return f"mm.{suffix}"
+
+        # === Special Phi-4 tensors ===
+        if name == "model.embed_tokens_extend.image_embed.glb_GN":
+            return "v.glb_GN"
+        if name == "model.embed_tokens_extend.image_embed.sub_GN":
+            return "v.sub_GN"
+
+        # Unknown vision tensor
+        print(f"Warning: unmapped vision tensor: {name}")
+        return None
+
+    def _map_to_conformer_tensor_name(self, name: str) -> str | None:
+        """Map Phi-4 audio Conformer tensor names to LFM2A Conformer format expected by llama.cpp."""
+        # Vision-only mode: skip all audio tensors entirely.
+        # The audio encoder code paths in mtmd remain intact for future use,
+        # but no audio tensors are written to the GGUF.
+        return None
+
+        import re
+        
+        # Strip .base_layer if present
+        name = name.replace(".base_layer", "")
+        
+        prefix = "model.embed_tokens_extend.audio_embed."
+        if not name.startswith(prefix):
+            return None
+        
+        suffix = name[len(prefix):]
+        
+        # === Pre-encode convolutional subsampling ===
+        # encoder.embed.conv.{0,2,3,5,6}.{weight,bias} -> a.conv1d.{i}.{weight,bias}
+        m = re.match(r"encoder\.embed\.conv\.(\d+)\.(weight|bias)", suffix)
+        if m:
+            idx = int(m.group(1))
+            param = m.group(2)
+            # LFM2A expects indices 0,2,3,5,6
+            if idx in [0, 2, 3, 5, 6]:
+                return f"a.conv1d.{idx}.{param}"
+        
+        # encoder.embed.out.{weight,bias} -> a.pre_encode.out.{weight,bias}
+        if suffix == "encoder.embed.out.weight":
+            return "a.pre_encode.out.weight"
+        if suffix == "encoder.embed.out.bias":
+            return "a.pre_encode.out.bias"
+        
+        # encoder.encoder_embedding.{global_mean,global_invstd} -> a.global_mean / a.global_invstd
+        if suffix == "encoder.encoder_embedding.global_mean":
+            return "a.global_mean"
+        if suffix == "encoder.encoder_embedding.global_invstd":
+            return "a.global_invstd"
+        
+        # === Conformer encoder layers: encoders.{i}.* -> a.blk.{i}.* ===
+        m = re.match(r"encoder\.encoders\.(\d+)\.(.*)", suffix)
+        if m:
+            i = int(m.group(1))
+            rest = m.group(2)
+            
+            # Attention: self_attn.linear_{q,k,v,out}.{weight,bias} -> a.blk.{i}.attn_{q,k,v,out}.{weight,bias}
+            if rest == "self_attn.linear_q.weight": return f"a.blk.{i}.attn_q.weight"
+            if rest == "self_attn.linear_q.bias":   return f"a.blk.{i}.attn_q.bias"
+            if rest == "self_attn.linear_k.weight": return f"a.blk.{i}.attn_k.weight"
+            if rest == "self_attn.linear_k.bias":   return f"a.blk.{i}.attn_k.bias"
+            if rest == "self_attn.linear_v.weight": return f"a.blk.{i}.attn_v.weight"
+            if rest == "self_attn.linear_v.bias":   return f"a.blk.{i}.attn_v.bias"
+            if rest == "self_attn.linear_out.weight": return f"a.blk.{i}.attn_out.weight"
+            if rest == "self_attn.linear_out.bias":   return f"a.blk.{i}.attn_out.bias"
+            
+            # Layer norms: layer_norm_att -> ln1, layer_norm -> ln2
+            if rest == "layer_norm_att.weight": return f"a.blk.{i}.ln1.weight"
+            if rest == "layer_norm_att.bias":   return f"a.blk.{i}.ln1.bias"
+            if rest == "layer_norm.weight": return f"a.blk.{i}.ln2.weight"
+            if rest == "layer_norm.bias":   return f"a.blk.{i}.ln2.bias"
+            
+            # Feed-forward input (first FFN): feed_forward_in.net.{0,2}.linear -> ffn_up/ffn_down
+            # feed_forward_in.layer_norm -> ffn_norm
+            if rest == "feed_forward_in.layer_norm.weight": return f"a.blk.{i}.ffn_norm.weight"
+            if rest == "feed_forward_in.layer_norm.bias":   return f"a.blk.{i}.ffn_norm.bias"
+            if rest == "feed_forward_in.net.0.linear.weight": return f"a.blk.{i}.ffn_up.weight"
+            if rest == "feed_forward_in.net.0.linear.bias":   return f"a.blk.{i}.ffn_up.bias"
+            if rest == "feed_forward_in.net.2.weight": return f"a.blk.{i}.ffn_down.weight"
+            if rest == "feed_forward_in.net.2.bias":   return f"a.blk.{i}.ffn_down.bias"
+            
+            # Feed-forward output (second FFN): feed_forward_out.net.{0,2}.linear -> ffn_up_1/ffn_down_1
+            # feed_forward_out.layer_norm -> ffn_norm_1
+            if rest == "feed_forward_out.layer_norm.weight": return f"a.blk.{i}.ffn_norm_1.weight"
+            if rest == "feed_forward_out.layer_norm.bias":   return f"a.blk.{i}.ffn_norm_1.bias"
+            if rest == "feed_forward_out.net.0.linear.weight": return f"a.blk.{i}.ffn_up_1.weight"
+            if rest == "feed_forward_out.net.0.linear.bias":   return f"a.blk.{i}.ffn_up_1.bias"
+            if rest == "feed_forward_out.net.2.weight": return f"a.blk.{i}.ffn_down_1.weight"
+            if rest == "feed_forward_out.net.2.bias":   return f"a.blk.{i}.ffn_down_1.bias"
+            
+            # Convolution module: conv.* -> conv_*
+            # conv.layer_norm -> norm_conv
+            if rest == "conv.layer_norm.weight": return f"a.blk.{i}.norm_conv.weight"
+            if rest == "conv.layer_norm.bias":   return f"a.blk.{i}.norm_conv.bias"
+            
+            # conv.dw_sep_conv_1d.dw_conv -> conv_dw
+            if rest == "conv.dw_sep_conv_1d.dw_conv.weight": return f"a.blk.{i}.conv_dw.weight"
+            if rest == "conv.dw_sep_conv_1d.dw_conv.bias":   return f"a.blk.{i}.conv_dw.bias"
+            
+            # conv.glu.ext_pw_conv_1d -> conv_pw1 (pre-GLU conv, outputs 2*dim)
+            # In Phi-4, GLUPointWiseConv.ext_pw_conv_1d is Conv1d(1024, 2048, 1) which
+            # produces 2*dim for the GLU split - this matches LFM2A's conv_pw1 exactly.
+            if rest == "conv.glu.ext_pw_conv_1d.weight": return f"a.blk.{i}.conv_pw1.weight"
+            if rest == "conv.glu.ext_pw_conv_1d.bias":   return f"a.blk.{i}.conv_pw1.bias"
+            
+            # conv.glu.b1, conv.glu.b2 -> additive biases on value/gate halves of GLU
+            if rest == "conv.glu.b1":
+                return f"a.blk.{i}.conv_glu_b1"
+            if rest == "conv.glu.b2":
+                return f"a.blk.{i}.conv_glu_b2"
+            
+            # conv.dw_sep_conv_1d.pw_conv -> conv_pw_mid (post-depthwise pointwise conv)
+            # Phi-4's DepthWiseSeperableConv1d has: dw_conv -> pw_conv -> activation -> ext_pw_conv
+            if rest == "conv.dw_sep_conv_1d.pw_conv.weight": return f"a.blk.{i}.conv_pw_mid.weight"
+            if rest == "conv.dw_sep_conv_1d.pw_conv.bias":   return f"a.blk.{i}.conv_pw_mid.bias"
+            
+            # conv.ext_pw_conv_1d -> conv_pw2 (final pointwise after activation)
+            if rest == "conv.ext_pw_conv_1d.weight": return f"a.blk.{i}.conv_pw2.weight"
+            if rest == "conv.ext_pw_conv_1d.bias":   return f"a.blk.{i}.conv_pw2.bias"
+            
+            # Phi-4 has NO conv_norm (post-depthwise batch norm) or pos_bias_u/v or linear_pos.
+            # These are emitted as synthetic identity/zero tensors in modify_tensors.
+        
+        # === Audio projection MLP: audio_projection.speech.{0,2}.* -> mm.a.mlp.{1,3}.* ===
+        # LFM2A expects: mm.0=LayerNorm, mm.1=FFN up, mm.3=FFN down
+        # Phi-4: speech.0=Linear(1024->3072), speech.2=Linear(3072->3072) (no pre-LayerNorm)
+        # Map: speech.0->mm.1, speech.2->mm.3. mm.0 (identity LayerNorm) is added in modify_tensors
+        m = re.match(r"audio_projection\.speech\.(\d+)\.(weight|bias)", suffix)
+        if m:
+            idx = int(m.group(1))
+            param = m.group(2)
+            if idx == 0:
+                return f"mm.a.mlp.1.{param}"
+            elif idx == 2:
+                return f"mm.a.mlp.3.{param}"
+        
+        # === T5 relative attention bias ===
+        # encoder.relative_attention_bias_layer.bias_values.weight -> a.rel_attn_bias
+        if suffix == "encoder.relative_attention_bias_layer.bias_values.weight":
+            return "a.rel_attn_bias"
+        
+        # Unknown audio tensor
+        print(f"Warning: unmapped audio tensor: {name}")
+        return None
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        # Vision-only: no audio-specific F32 overrides needed.
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Shayan's Vision Tensor Handler: Map Phi-4 vision tensors to standard CLIP names
+        if name.startswith("model.embed_tokens_extend.image_embed"):
+            clip_name = self._map_to_clip_tensor_name(name)
+            if clip_name is not None:
+                yield (clip_name, data_torch)
+            return
+        
+        # Shayan's Audio Tensor Handler: Map Phi-4 audio Conformer tensors to LFM2A format
+        if name.startswith("model.embed_tokens_extend.audio_embed"):
+            conformer_name = self._map_to_conformer_tensor_name(name)
+            if conformer_name is not None:
+                # LFM2A expects mm.a.mlp.0 (LayerNorm) before the FFN; Phi-4 has none
+                # When we first write an audio projection tensor, add identity LayerNorm
+                if conformer_name == "mm.a.mlp.1.weight" and self.hparams_audio is not None:
+                    n_embd = self.hparams_audio.get("hidden_size", 1024)
+                    import torch
+                    identity_w = torch.ones(n_embd, dtype=data_torch.dtype)
+                    identity_b = torch.zeros(n_embd, dtype=data_torch.dtype)
+                    yield ("mm.a.mlp.0.weight", identity_w)
+                    yield ("mm.a.mlp.0.bias", identity_b)
+                # Phi-4 Conformer differs from LFM2A in several ways. Emit all missing
+                # synthetic tensors on first block tensor to avoid repeated missing-tensor errors.
+                # Tensors LFM2A requires but Phi-4 lacks:
+                #   - pos_bias_u/v      (Phi-4 uses T5-style relative attention, not per-head bias)
+                #   - linear_pos.weight (projects sinusoidal pos_emb; Phi-4 uses absolute + T5 bias)
+                #   - conv_norm.w/b     (batch norm after depthwise conv; Phi-4 has none)
+                #   - a.position_embd   (conformer assert needs it; pos_emb is generated at runtime)
+                if conformer_name.startswith("a.blk.") and not getattr(self, "_pos_bias_emitted", False):
+                    self._pos_bias_emitted = True
+                    n_layer = self.hparams_audio.get("num_hidden_layers", 24) if self.hparams_audio else 24
+                    n_head = self.hparams_audio.get("num_attention_heads", 16) if self.hparams_audio else 16
+                    n_embd = self.hparams_audio.get("hidden_size", 1024) if self.hparams_audio else 1024
+                    d_head = n_embd // n_head
+                    import torch
+                    # --- global synthetic tensors ---
+                    # position_embd: conformer asserts ne[1] >= n_pos where n_pos = n_frames/2
+                    # ggml ne[0]=cols, ne[1]=rows; PyTorch (rows, cols) -> ggml (cols, rows)
+                    # Need ne[1]=10000 >= n_pos, ne[0]=512 (d_model for pos_emb)
+                    yield ("a.position_embd.weight", torch.zeros((10000, 512), dtype=data_torch.dtype))
+                    # --- per-block synthetic tensors ---
+                    # pos_bias_u/v: Qcur is reshaped to ggml ne=(d_head, n_head, n_seq)
+                    # PyTorch (n_head, d_head) -> GGUF ne[0]=d_head, ne[1]=n_head -> broadcasts correctly
+                    pos_bias_zeros = torch.zeros((n_head, d_head), dtype=data_torch.dtype)
+                    linear_pos_w   = torch.zeros((d_head * n_head, 512), dtype=data_torch.dtype)
+                    conv_norm_w    = torch.ones(n_embd, dtype=data_torch.dtype)   # identity scale
+                    conv_norm_b    = torch.zeros(n_embd, dtype=data_torch.dtype)  # identity bias
+                    for il in range(n_layer):
+                        yield (f"a.blk.{il}.pos_bias_u", pos_bias_zeros.clone())
+                        yield (f"a.blk.{il}.pos_bias_v", pos_bias_zeros.clone())
+                        yield (f"a.blk.{il}.linear_pos.weight", linear_pos_w.clone())
+                        yield (f"a.blk.{il}.conv_norm.weight", conv_norm_w.clone())
+                        yield (f"a.blk.{il}.conv_norm.bias", conv_norm_b.clone())
+                # --- Shape fixes for ggml compatibility ---
+                #
+                # 1) Pre-encode Conv2d biases: ggml_conv_2d output is (OW, OH, OC, N).
+                #    A 1D bias (OC,) gives ne[0]=OC which must divide OW — almost never true.
+                #    Reshape to 3D (OC, 1, 1) -> ggml ne=(1, 1, OC) so broadcast works.
+                if conformer_name.startswith("a.conv1d.") and conformer_name.endswith(".bias"):
+                    if data_torch.dim() == 1:
+                        data_torch = data_torch.unsqueeze(-1).unsqueeze(-1)  # (OC,) -> (OC, 1, 1)
+                #
+                # 2) Squeeze 3D Conv1d weights to 2D for ggml_mul_mat / ggml_ssm_conv:
+                #    conv_pw1/pw2: (out, in, 1) -> (out, in)  [kernel_size=1 pointwise]
+                #    conv_dw: (channels, 1, kernel) -> (channels, kernel) [groups=channels depthwise]
+                if data_torch.dim() == 3 and (
+                    ".conv_pw1.weight" in conformer_name or
+                    ".conv_pw2.weight" in conformer_name or
+                    ".conv_pw_mid.weight" in conformer_name
+                ):
+                    data_torch = data_torch.squeeze(-1)  # remove kernel_size=1 dim
+                elif data_torch.dim() == 3 and ".conv_dw.weight" in conformer_name:
+                    data_torch = data_torch.squeeze(1)   # remove groups=1 dim
+                # GLU b1/b2: (1, 1024, 1) -> (1024,)
+                if ".conv_glu_b1" in conformer_name or ".conv_glu_b2" in conformer_name:
+                    data_torch = data_torch.squeeze()
+                #
+                # 3) F32 forcing is now handled selectively by tensor_force_quant()
+                #    (only conv kernels and a few other tensors need F32).
+                #
+                # 4) Split GLULinear weights for FFN: Phi-4 FFN uses GLULinear which
+                #    creates a combined (2*d_inner, d_model) weight and (2*d_inner,) bias.
+                #    The GLU computes: x1 * sigmoid(x2) where x1, x2 are the two halves.
+                #    Split into ffn_up (first half / value) + ffn_gate (second half / gate)
+                #    so the gated FFN path in build_ffn is used.
+                #    NOTE: build_ffn uses ggml_swiglu_split which is silu-gated, not sigmoid-gated.
+                #    This introduces a minor activation mismatch (TODO: fix in conformer.cpp).
+                is_glu_up = (
+                    conformer_name.endswith(".ffn_up.weight") or
+                    conformer_name.endswith(".ffn_up.bias") or
+                    conformer_name.endswith(".ffn_up_1.weight") or
+                    conformer_name.endswith(".ffn_up_1.bias"))
+                if is_glu_up and data_torch.shape[0] % 2 == 0:
+                    half = data_torch.shape[0] // 2
+                    up_half = data_torch[:half]
+                    gate_half = data_torch[half:]
+                    if ".ffn_up_1." in conformer_name:
+                        gate_name = conformer_name.replace(".ffn_up_1.", ".ffn_gate_1.")
+                    else:
+                        gate_name = conformer_name.replace(".ffn_up.", ".ffn_gate.")
+                    yield (conformer_name, up_half)
+                    yield (gate_name, gate_half)
+                else:
+                    yield (conformer_name, data_torch)
+            return
+
+        # For non-multimodal tensors, use parent's logic
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def map_tensor_name(self, name: str, try_suffixes: Sequence[str] = (".weight", ".bias")) -> str | None:
+        # Shayan's Multimodal Tensor Bypass: For vision/audio tensors, return original name
+        # (actual mapping happens in modify_tensors via _map_to_clip_tensor_name / _map_to_conformer_tensor_name)
+        if (name.startswith("model.embed_tokens_extend.image_embed") or 
+            name.startswith("model.embed_tokens_extend.audio_embed")):
+            return name
+        
+        # For non-vision tensors, use the parent's mapping logic
+        # Remove the 'base_layer' and 'lora' noise so the script finds the core weights
+        clean_name = name.replace(".base_layer", "")
+        
+        # If it's a LoRA tensor, we actually want to skip it for the F16 master
+        if ".lora_" in clean_name:
+            return None
+        
+        new_name = self.tensor_map.get_name(key=clean_name, try_suffixes=try_suffixes)
+        if new_name is None:
+            print(f"Skipping truly unknown tensor: {name}")
+            return None
+        return new_name
 
     def set_gguf_parameters(self):
+        # For MMPROJ extraction, write MMPROJ parameters directly (Phi-4 doesn't have standard preprocessor_config)
+        if self.model_arch == gguf.MODEL_ARCH.MMPROJ or hasattr(self, 'hparams_vision') or hasattr(self, 'hparams_audio'):
+            self.gguf_writer.add_file_type(self.ftype)
+            # For mixed vision+audio models, set separate projector types (not the main one)
+            # The main clip.projector_type should remain empty so the C++ code reads modality-specific types
+
+            if self.hparams_vision is not None:
+                self.gguf_writer.add_clip_has_vision_encoder(True)
+                # Set vision-specific projector type for mixed models
+                self.gguf_writer.add_clip_vision_projector_type("mlp")
+                self.gguf_writer.add_vision_projection_dim(self.n_embd_text)
+                self.gguf_writer.add_vision_image_size(self.hparams_vision.get("image_size", 448))
+                self.gguf_writer.add_vision_patch_size(self.hparams_vision.get("patch_size", 14))
+                self.gguf_writer.add_vision_embedding_length(self.hparams_vision.get("hidden_size", 1152))
+                self.gguf_writer.add_vision_feed_forward_length(self.hparams_vision.get("intermediate_size", 4304))
+                self.gguf_writer.add_vision_block_count(self.hparams_vision.get("num_hidden_layers", 27))
+                self.gguf_writer.add_vision_head_count(self.hparams_vision.get("num_attention_heads", 16))
+                self.gguf_writer.add_vision_attention_layernorm_eps(1e-6)
+                # Phi-4 uses hidden_states[-2] (second-to-last layer, WITHOUT post_layernorm)
+                # Default behavior (no feature_layer set): max_feature_layer = n_layer-1 = 26
+                # Loop runs layers 0-25, giving output of layer 25 = hidden_states[-2]
+                # Post_layernorm tensors are excluded from GGUF so they don't get applied
+                # avg_pool_2d compression: reduces 1024 tokens to 256 (kernel=2, stride=2)
+                self.gguf_writer.add_vision_projector_scale_factor(2)
+                # Standard ImageNet normalization values
+                self.gguf_writer.add_vision_image_mean([0.48145466, 0.4578275, 0.40821073])
+                self.gguf_writer.add_vision_image_std([0.26862954, 0.26130258, 0.27577711])
+
+            # Audio encoder: disabled (vision-only mode).
+            # The audio conversion code is preserved below _map_to_conformer_tensor_name
+            # but returns None immediately, so no audio tensors or metadata are written.
+
+            return
+        
+        # Otherwise, set Phi3 text model parameters (for regular text model conversion)
         n_embd = self.find_hparam(["hidden_size", "n_embd"])
         n_head = self.find_hparam(["num_attention_heads", "n_head"])
         n_head_kv = self.find_hparam(["num_key_value_heads", "n_head_kv"])
@@ -4830,7 +5117,14 @@ class Phi3MiniModel(TextModel):
         self.gguf_writer.add_head_count_kv(n_head_kv)
         self.gguf_writer.add_layer_norm_rms_eps(rms_eps)
         self.gguf_writer.add_rope_dimension_count(rope_dims)
-        self.gguf_writer.add_rope_freq_base(self.rope_parameters.get("full_attention", self.rope_parameters)["rope_theta"])
+        # Ensure rope_parameters exists and has the required structure
+        if not hasattr(self, 'rope_parameters') or not self.rope_parameters:
+            self.rope_parameters = self.hparams.get("rope_parameters", self.hparams.get("rope_scaling")) or {}
+        rope_params = self.rope_parameters.get("full_attention", self.rope_parameters)
+        rope_theta = rope_params.get("rope_theta") if isinstance(rope_params, dict) else None
+        if rope_theta is None:
+            rope_theta = self.find_hparam(["global_rope_theta", "rope_global_theta", "rope_theta_global", "rope_theta", "rotary_emb_base"], optional=True) or 10000.0
+        self.gguf_writer.add_rope_freq_base(rope_theta)
         self.gguf_writer.add_file_type(self.ftype)
         sliding_window = self.hparams.get("sliding_window")
         # use zero value of sliding_window to distinguish Phi-4 from other PHI3 models
@@ -4839,6 +5133,11 @@ class Phi3MiniModel(TextModel):
         self.gguf_writer.add_sliding_window(sliding_window)
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        # For MMPROJ extraction, don't generate extra tensors (those are for text models)
+        if self.model_arch == gguf.MODEL_ARCH.MMPROJ or hasattr(self, 'hparams_vision') or hasattr(self, 'hparams_audio'):
+            return ()
+        
+        # Otherwise, generate extra tensors for text model conversion
         n_embd = self.find_hparam(["hidden_size", "n_embd"])
         n_head = self.find_hparam(["num_attention_heads", "n_head"])
         max_pos_embds = self.find_hparam(["n_positions", "max_position_embeddings"])
@@ -11699,9 +11998,33 @@ def main() -> None:
     disable_mistral_community_chat_template = args.disable_mistral_community_chat_template
 
     with torch.inference_mode():
+        # --- SHAYAN'S FINAL DIRECT INJECTION ---
+        # This ignores the config file and forces the vision extraction
+        if args.mmproj:
+            print("!!! FORCING VISION PROJECTOR EXTRACTION NOW !!!")
+            model_instance = Phi3MiniModel(
+                dir_model,
+                ftype_map[args.outtype],
+                fname_out,
+                is_big_endian=args.bigendian,
+                use_temp_file=args.use_temp_file,
+                eager=args.no_lazy,
+                metadata_override=args.metadata,
+                model_name=args.model_name,
+                split_max_tensors=args.split_max_tensors,
+                split_max_size=split_str_to_n_bytes(args.split_max_size),
+                dry_run=args.dry_run,
+                small_first_shard=args.no_tensor_first_split,
+            )
+            model_instance.write()
+            print("Vision extraction complete. Exiting script.")
+            return 
+        # ---------------------------------------
+
         output_type = ftype_map[args.outtype]
         model_type = ModelType.MMPROJ if args.mmproj else ModelType.TEXT
         hparams = ModelBase.load_hparams(dir_model, is_mistral_format)
+
         if not is_mistral_format:
             model_architecture = get_model_architecture(hparams, model_type)
             logger.info(f"Model architecture: {model_architecture}")
@@ -11718,16 +12041,44 @@ def main() -> None:
         else:
             model_class = MistralModel
 
-        model_instance = model_class(dir_model, output_type, fname_out,
-                                     is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
-                                     eager=args.no_lazy,
-                                     metadata_override=args.metadata, model_name=args.model_name,
-                                     split_max_tensors=args.split_max_tensors,
-                                     split_max_size=split_str_to_n_bytes(args.split_max_size), dry_run=args.dry_run,
-                                     small_first_shard=args.no_tensor_first_split,
-                                     remote_hf_model_id=hf_repo_id, disable_mistral_community_chat_template=disable_mistral_community_chat_template,
-                                     sentence_transformers_dense_modules=args.sentence_transformers_dense_modules
-                                     )
+        # Shayan's Force: Ignore architecture checks and just RUN
+        if args.mmproj:
+            print("MANUALLY FORCING Vision Projector Extraction...")
+            model_instance = Phi3MiniModel(
+                dir_model,
+                output_type,
+                fname_out,
+                is_big_endian=args.bigendian,
+                use_temp_file=args.use_temp_file,
+                eager=args.no_lazy,
+                metadata_override=args.metadata,
+                model_name=args.model_name,
+                split_max_tensors=args.split_max_tensors,
+                split_max_size=split_str_to_n_bytes(args.split_max_size),
+                dry_run=args.dry_run,
+                small_first_shard=args.no_tensor_first_split,
+                remote_hf_model_id=hf_repo_id,
+                disable_mistral_community_chat_template=disable_mistral_community_chat_template,
+                sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
+            )
+        else:
+            model_instance = model_class(
+                dir_model,
+                output_type,
+                fname_out,
+                is_big_endian=args.bigendian,
+                use_temp_file=args.use_temp_file,
+                eager=args.no_lazy,
+                metadata_override=args.metadata,
+                model_name=args.model_name,
+                split_max_tensors=args.split_max_tensors,
+                split_max_size=split_str_to_n_bytes(args.split_max_size),
+                dry_run=args.dry_run,
+                small_first_shard=args.no_tensor_first_split,
+                remote_hf_model_id=hf_repo_id,
+                disable_mistral_community_chat_template=disable_mistral_community_chat_template,
+                sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
+            )
 
         if args.vocab_only:
             logger.info("Exporting model vocab...")

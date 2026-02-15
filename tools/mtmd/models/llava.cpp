@@ -164,6 +164,20 @@ ggml_cgraph * clip_graph_llava::build() {
 
         // llava projector
         if (proj_type == PROJECTOR_TYPE_MLP) {
+            // Phi-4 style avg_pool_2d token compression (when scale_factor is set)
+            if (hparams.n_merge > 1) {
+                const int patches_per_side = n_patches_x;
+                embeddings = ggml_transpose(ctx0, embeddings);
+                embeddings = ggml_cont_4d(ctx0, embeddings,
+                    patches_per_side, patches_per_side, n_embd, 1);
+                embeddings = ggml_pool_2d(ctx0, embeddings, GGML_OP_POOL_AVG,
+                    hparams.n_merge, hparams.n_merge,
+                    hparams.n_merge, hparams.n_merge, 0, 0);
+                embeddings = ggml_reshape_3d(ctx0, embeddings,
+                    embeddings->ne[0] * embeddings->ne[1], n_embd, 1);
+                embeddings = ggml_cont(ctx0, ggml_transpose(ctx0, embeddings));
+            }
+
             embeddings = ggml_mul_mat(ctx0, model.mm_0_w, embeddings);
             embeddings = ggml_add(ctx0, embeddings, model.mm_0_b);
 

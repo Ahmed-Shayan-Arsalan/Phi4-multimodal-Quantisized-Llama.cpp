@@ -15,6 +15,7 @@ enum ffn_op_type {
     FFN_GELU_ERF,
     FFN_SILU,
     FFN_GELU_QUICK,
+    FFN_SIGMOID,   // sigmoid-gated GLU: sigmoid(gate) * up (used by Phi-4 Conformer)
 };
 
 enum norm_type {
@@ -151,6 +152,8 @@ struct clip_layer {
     ggml_tensor * ff_norm_1_b   = nullptr;
     ggml_tensor * ff_up_1_w     = nullptr;
     ggml_tensor * ff_up_1_b     = nullptr;
+    ggml_tensor * ff_gate_1_w   = nullptr;
+    ggml_tensor * ff_gate_1_b   = nullptr;
     ggml_tensor * ff_down_1_w   = nullptr;
     ggml_tensor * ff_down_1_b   = nullptr;
     ggml_tensor * pos_bias_u    = nullptr;
@@ -165,8 +168,14 @@ struct clip_layer {
     ggml_tensor * conv_dw_b     = nullptr;
     ggml_tensor * conv_pw1_w    = nullptr;
     ggml_tensor * conv_pw1_b    = nullptr;
+    ggml_tensor * conv_pw_mid_w = nullptr;  // post-depthwise pointwise conv (Phi-4)
+    ggml_tensor * conv_pw_mid_b = nullptr;
     ggml_tensor * conv_pw2_w    = nullptr;
     ggml_tensor * conv_pw2_b    = nullptr;
+
+    // GLU biases (Phi-4): value = value + b1, gate = gate + b2
+    ggml_tensor * conv_glu_b1 = nullptr;
+    ggml_tensor * conv_glu_b2 = nullptr;
 
     bool has_deepstack() const {
         return deepstack_fc1_w != nullptr;
@@ -373,6 +382,13 @@ struct clip_model {
     std::array<ggml_tensor *, 7> pre_encode_conv_X_b = {nullptr};
     ggml_tensor * pre_encode_out_w = nullptr;
     ggml_tensor * pre_encode_out_b = nullptr;
+
+    // T5 relative attention bias (shared across all layers)
+    ggml_tensor * rel_attn_bias = nullptr;
+
+    // Global mel normalization (encoder_embedding)
+    ggml_tensor * global_mean   = nullptr;
+    ggml_tensor * global_invstd = nullptr;
 
     bool audio_has_avgpool() const {
         return proj_type == PROJECTOR_TYPE_QWEN2A

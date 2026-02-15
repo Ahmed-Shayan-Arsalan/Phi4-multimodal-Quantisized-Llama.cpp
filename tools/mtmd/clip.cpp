@@ -10,7 +10,6 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
-#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -559,6 +558,15 @@ ggml_tensor * clip_graph::build_ffn(
                 cur = ggml_gelu_quick(ctx0, cur);
                 cb(cur, "ffn_gelu_quick", il);
             } break;
+        case FFN_SIGMOID:
+            if (gate) {
+                // sigmoid-gated GLU: sigmoid(gate) * up
+                cur = ggml_mul(ctx0, ggml_sigmoid(ctx0, cur), tmp);
+                cb(cur, "ffn_sigmoid_glu", il);
+            } else {
+                cur = ggml_sigmoid(ctx0, cur);
+                cb(cur, "ffn_sigmoid", il);
+            } break;
     }
 
     if (down) {
@@ -1099,6 +1107,11 @@ struct clip_model_loader {
 
             // model-specific params
             switch (model.proj_type) {
+                case PROJECTOR_TYPE_MLP:
+                    {
+                        // Phi-4 style avg_pool_2d: read optional scale_factor for token compression
+                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
+                    } break;
                 case PROJECTOR_TYPE_MINICPMV:
                     {
                         if (hparams.minicpmv_version == 0) {
@@ -1117,8 +1130,9 @@ struct clip_model_loader {
                 case PROJECTOR_TYPE_LFM2:
                     {
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
-                        // ref: https://huggingface.co/LiquidAI/LFM2.5-VL-1.6B/blob/main/processor_config.json
-                        hparams.set_limit_image_tokens(64, 256);
+                        // ref: https://huggingface.co/LiquidAI/LFM2-VL-3B/blob/main/preprocessor_config.json
+                        // config above specifies number of tokens after downsampling, while here it is before, relax lowerbound to 64
+                        hparams.set_limit_image_tokens(64, 1024);
                     } break;
                 case PROJECTOR_TYPE_PIXTRAL:
                 case PROJECTOR_TYPE_LIGHTONOCR:
@@ -1794,6 +1808,13 @@ struct clip_model_loader {
                     model.pre_encode_out_w    = get_tensor(string_format(TN_PRE_ENCODE_OUT, "weight"));
                     model.pre_encode_out_b    = get_tensor(string_format(TN_PRE_ENCODE_OUT, "bias"));
 
+                    // T5 relative attention bias (shared across all conformer layers)
+                    model.rel_attn_bias = get_tensor(TN_REL_ATTN_BIAS, false);
+
+                    // Global mel normalization
+                    model.global_mean   = get_tensor(TN_GLOBAL_MEAN,   false);
+                    model.global_invstd = get_tensor(TN_GLOBAL_INVSTD, false);
+
                     model.mm_0_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 0, "weight"));
                     model.mm_0_b = get_tensor(string_format(TN_MM_AUDIO_MLP, 0, "bias"));
                     model.mm_1_w = get_tensor(string_format(TN_MM_AUDIO_MLP, 1, "weight"));
@@ -1810,6 +1831,8 @@ struct clip_model_loader {
                         layer.ff_norm_1_b = get_tensor(string_format(TN_FFN_NORM_1, prefix, il, "bias"));
                         layer.ff_up_1_w   = get_tensor(string_format(TN_FFN_UP_1,   prefix, il, "weight"));
                         layer.ff_up_1_b   = get_tensor(string_format(TN_FFN_UP_1,   prefix, il, "bias"));
+                        layer.ff_gate_1_w = get_tensor(string_format(TN_FFN_GATE_1, prefix, il, "weight"), false);
+                        layer.ff_gate_1_b = get_tensor(string_format(TN_FFN_GATE_1, prefix, il, "bias"),   false);
                         layer.ff_down_1_w = get_tensor(string_format(TN_FFN_DOWN_1, prefix, il, "weight"));
                         layer.ff_down_1_b = get_tensor(string_format(TN_FFN_DOWN_1, prefix, il, "bias"));
 
@@ -1823,12 +1846,16 @@ struct clip_model_loader {
 
                         layer.conv_norm_w  = get_tensor(string_format(TN_CONV_NORM, prefix, il, "weight"));
                         layer.conv_norm_b  = get_tensor(string_format(TN_CONV_NORM, prefix, il, "bias"));
-                        layer.conv_dw_w    = get_tensor(string_format(TN_CONV_DW,   prefix, il, "weight"));
-                        layer.conv_dw_b    = get_tensor(string_format(TN_CONV_DW,   prefix, il, "bias"));
-                        layer.conv_pw1_w   = get_tensor(string_format(TN_CONV_PW1,  prefix, il, "weight"));
-                        layer.conv_pw1_b   = get_tensor(string_format(TN_CONV_PW1,  prefix, il, "bias"));
-                        layer.conv_pw2_w   = get_tensor(string_format(TN_CONV_PW2,  prefix, il, "weight"));
-                        layer.conv_pw2_b   = get_tensor(string_format(TN_CONV_PW2,  prefix, il, "bias"));
+                        layer.conv_dw_w    = get_tensor(string_format(TN_CONV_DW,     prefix, il, "weight"));
+                        layer.conv_dw_b    = get_tensor(string_format(TN_CONV_DW,     prefix, il, "bias"));
+                        layer.conv_pw1_w   = get_tensor(string_format(TN_CONV_PW1,    prefix, il, "weight"));
+                        layer.conv_pw1_b   = get_tensor(string_format(TN_CONV_PW1,    prefix, il, "bias"));
+                        layer.conv_pw_mid_w = get_tensor(string_format(TN_CONV_PW_MID, prefix, il, "weight"), false);
+                        layer.conv_pw_mid_b = get_tensor(string_format(TN_CONV_PW_MID, prefix, il, "bias"),   false);
+                        layer.conv_glu_b1  = get_tensor(string_format(TN_CONV_GLU_B1, prefix, il), false);
+                        layer.conv_glu_b2  = get_tensor(string_format(TN_CONV_GLU_B2, prefix, il), false);
+                        layer.conv_pw2_w   = get_tensor(string_format(TN_CONV_PW2,    prefix, il, "weight"));
+                        layer.conv_pw2_b   = get_tensor(string_format(TN_CONV_PW2,    prefix, il, "bias"));
                     }
                 } break;
             default:
@@ -2807,119 +2834,6 @@ private:
     }
 };
 
-// ref: https://github.com/huggingface/transformers/blob/v5.1.0/src/transformers/models/lfm2_vl/image_processing_lfm2_vl_fast.py
-// some of the logic is similar to llava_uhd, but with different hyperparameters and some logic is unique (e.g. grid layout)
-struct lfm2_vl_image_processor {
-    // ref: https://huggingface.co/LiquidAI/LFM2.5-VL-1.6B/blob/main/processor_config.json
-    static constexpr int   min_tiles            = 2;
-    static constexpr int   max_tiles            = 10;
-    static constexpr float max_pixels_tolerance = 2.0f;
-    static constexpr int   tile_size            = 512;
-
-    static llava_uhd::slice_instructions get_slice_instructions(struct clip_ctx * ctx, const clip_image_size & original_size) {
-        llava_uhd::slice_instructions inst;
-        const auto & params  = ctx->model.hparams;
-        const int align_size = params.patch_size * params.n_merge;
-
-        inst.interpolation_overview = img_tool::RESIZE_ALGO_BILINEAR;
-        inst.interpolation_refined  = img_tool::RESIZE_ALGO_BILINEAR;
-        inst.overview_size          = img_tool::calc_size_preserved_ratio(original_size, align_size, params.image_min_pixels, params.image_max_pixels);
-
-        // tile if either dimension exceeds tile_size with tolerance
-        const bool needs_tiling = original_size.width > tile_size * max_pixels_tolerance || original_size.height > tile_size * max_pixels_tolerance;
-
-        if (!needs_tiling) {
-            inst.refined_size = clip_image_size{0, 0};
-            inst.grid_size    = clip_image_size{0, 0};
-            return inst;
-        }
-
-        const clip_image_size grid = get_grid_layout(original_size.height, original_size.width);
-
-        inst.grid_size    = grid;
-        inst.refined_size = clip_image_size{tile_size * grid.width, tile_size * grid.height};
-
-        LOG_DBG("%s: original size: %d x %d, overview size: %d x %d, refined size: %d x %d, grid size: %d x %d\n",
-                __func__,
-                original_size.width, original_size.height,
-                inst.overview_size.width, inst.overview_size.height,
-                inst.refined_size.width, inst.refined_size.height,
-                grid.width, grid.height);
-
-        for (int row = 0; row < grid.height; row++) {
-            for (int col = 0; col < grid.width; col++) {
-                llava_uhd::slice_coordinates slice;
-                slice.x    = col * tile_size;
-                slice.y    = row * tile_size;
-                slice.size = clip_image_size{tile_size, tile_size};
-                inst.slices.push_back(slice);
-                LOG_DBG("%s: slice %d: x=%d, y=%d, size=%d x %d\n",
-                        __func__, (int)inst.slices.size() - 1,
-                        slice.x, slice.y, slice.size.width, slice.size.height);
-            }
-        }
-
-        return inst;
-    }
-
-private:
-    static clip_image_size find_closest_aspect_ratio(
-            float aspect_ratio,
-            const std::vector<clip_image_size> & target_ratios,
-            int width, int height) {
-        float best_ratio_diff = std::numeric_limits<float>::max();
-        clip_image_size best_ratio = {1, 1};
-        const float area = static_cast<float>(width * height);
-
-        for (const auto & ratio : target_ratios) {
-            const float target_aspect_ratio = static_cast<float>(ratio.width) / ratio.height;
-            const float ratio_diff = std::abs(aspect_ratio - target_aspect_ratio);
-            if (ratio_diff < best_ratio_diff) {
-                best_ratio_diff = ratio_diff;
-                best_ratio = ratio;
-            } else if (ratio_diff == best_ratio_diff) {
-                const float target_area = static_cast<float>(tile_size * tile_size * ratio.width * ratio.height);
-                if (area > 0.5f * target_area) {
-                    best_ratio = ratio;
-                }
-            }
-        }
-        return best_ratio;
-    }
-
-    static std::vector<clip_image_size> get_target_ratios() {
-        std::vector<clip_image_size> ratios;
-        for (int n = min_tiles; n <= max_tiles; n++) {
-            for (int w = 1; w <= n; w++) {
-                for (int h = 1; h <= n; h++) {
-                    if (w * h >= min_tiles && w * h <= max_tiles) {
-                        bool found = false;
-                        for (const auto & r : ratios) {
-                            if (r.width == w && r.height == h) {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (!found) {
-                            ratios.push_back({w, h});
-                        }
-                    }
-                }
-            }
-        }
-        std::sort(ratios.begin(), ratios.end(), [](const clip_image_size & a, const clip_image_size & b) {
-            return a.width * a.height < b.width * b.height;
-        });
-        return ratios;
-    }
-
-    static clip_image_size get_grid_layout(int height, int width) {
-        const float aspect_ratio = static_cast<float>(width) / height;
-        const auto ratios = get_target_ratios();
-        return find_closest_aspect_ratio(aspect_ratio, ratios, width, height);
-    }
-};
-
 // returns the normalized float tensor for llava-1.5, for spatial_unpad with anyres processing for llava-1.6 it returns the normalized image patch tensors as a vector
 // res_imgs memory is being allocated here, previous allocations will be freed if found
 bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, struct clip_image_f32_batch * res_imgs) {
@@ -3134,20 +3048,6 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
             } break;
 
         case PROJECTOR_TYPE_LFM2:
-            {
-                auto const inst = lfm2_vl_image_processor::get_slice_instructions(ctx, original_size);
-                std::vector<clip_image_u8_ptr> imgs = llava_uhd::slice_image(img, inst);
-
-                for (size_t i = 0; i < imgs.size(); ++i) {
-                    clip_image_f32_ptr res(clip_image_f32_init());
-                    normalize_image_u8_to_f32(*imgs[i], *res, params.image_mean, params.image_std);
-                    res_imgs->entries.push_back(std::move(res));
-                }
-
-                res_imgs->grid_x = inst.grid_size.width;
-                res_imgs->grid_y = inst.grid_size.height;
-            } break;
-
         case PROJECTOR_TYPE_KIMIVL:
             {
                 GGML_ASSERT(params.image_min_pixels > 0 && params.image_max_pixels > 0);
@@ -3159,7 +3059,8 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
                 const std::array<uint8_t, 3> pad_color = {122, 116, 104};
 
                 clip_image_u8 resized_img;
-                img_tool::resize(*img, resized_img, target_size, img_tool::RESIZE_ALGO_BILINEAR, true, pad_color);
+                const bool pad = (ctx->proj_type() != PROJECTOR_TYPE_LFM2);
+                img_tool::resize(*img, resized_img, target_size, img_tool::RESIZE_ALGO_BILINEAR, pad, pad_color);
                 clip_image_f32_ptr res(clip_image_f32_init());
                 normalize_image_u8_to_f32(resized_img, *res, params.image_mean, params.image_std);
                 res_imgs->entries.push_back(std::move(res));
@@ -3307,7 +3208,11 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
         case PROJECTOR_TYPE_MLP_NORM:
         case PROJECTOR_TYPE_JANUS_PRO:
             {
-                // do nothing
+                // Phi-4 style avg_pool_2d: scale factor reduces spatial dims
+                int scale_factor = ctx->model.hparams.n_merge;
+                if (scale_factor > 1) {
+                    n_patches /= (scale_factor * scale_factor);
+                }
             } break;
         case PROJECTOR_TYPE_LDP:
         case PROJECTOR_TYPE_LDPV2:
@@ -3813,6 +3718,59 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                     }
                 }
                 set_input_f32("pos_emb", pos_emb);
+
+                // Compute T5 relative attention bias (if the model has it)
+                if (ctx->model.rel_attn_bias) {
+                    // Get T from the actual graph tensor (avoids mismatch with conv subsampling formula)
+                    ggml_tensor * t5_tensor = get_inp_tensor("t5_bias");
+                    const int T = (int)t5_tensor->ne[0];  // tensor shape is (T, T, n_head)
+                    const int t5_n_head = (int)t5_tensor->ne[2];
+                    const int num_buckets = (int)ctx->model.rel_attn_bias->ne[1];
+                    const int max_distance = num_buckets / 2;  // T5 convention
+
+                    // Read the embedding table from the model tensor
+                    std::vector<float> emb_table(ctx->model.rel_attn_bias->ne[0] * num_buckets);
+                    ggml_backend_tensor_get(ctx->model.rel_attn_bias, emb_table.data(), 0,
+                                           emb_table.size() * sizeof(float));
+
+                    // T5 relative position bucketing function (bidirectional)
+                    auto t5_bucket = [&](int relative_position) -> int {
+                        const int half_buckets = num_buckets / 2;
+                        const int max_exact = half_buckets / 2;
+                        int ret = 0;
+                        int n = -relative_position;
+                        if (n < 0) {
+                            ret += half_buckets;
+                            n = -n;
+                        }
+                        if (n < max_exact) {
+                            ret += n;
+                        } else {
+                            int val = max_exact + (int)(std::log((double)n / max_exact) /
+                                                        std::log((double)max_distance / max_exact) *
+                                                        (half_buckets - max_exact));
+                            if (val > half_buckets - 1) val = half_buckets - 1;
+                            ret += val;
+                        }
+                        return ret;
+                    };
+
+                    // Build the (T, T, n_head) bias matrix
+                    const int emb_n_head = (int)ctx->model.rel_attn_bias->ne[0];
+                    std::vector<float> t5_data((size_t)T * T * t5_n_head);
+                    for (int q = 0; q < T; q++) {
+                        for (int k = 0; k < T; k++) {
+                            int bucket = t5_bucket(k - q);
+                            for (int h = 0; h < t5_n_head; h++) {
+                                t5_data[(size_t)h * T * T + (size_t)q * T + k] =
+                                    emb_table[(size_t)bucket * emb_n_head + h];
+                            }
+                        }
+                    }
+                    GGML_ASSERT(t5_tensor->type == GGML_TYPE_F32);
+                    GGML_ASSERT(ggml_nelements(t5_tensor) == (int64_t)t5_data.size());
+                    ggml_backend_tensor_set(t5_tensor, t5_data.data(), 0, t5_data.size() * sizeof(float));
+                }
             } break;
         default:
             GGML_ABORT("Unknown projector type");
@@ -3900,7 +3858,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_COGVLM:
             return ctx->model.mm_4h_to_h_w->ne[1];
         case PROJECTOR_TYPE_LFM2A:
-            return ctx->model.position_embeddings->ne[0];
+            return ctx->model.mm_3_w->ne[1]; // output dim of audio adapter MLP (3072), not position_embeddings (512)
         case PROJECTOR_TYPE_GLM4V:
             return ctx->model.mm_ffn_down_w->ne[1];
         default:
