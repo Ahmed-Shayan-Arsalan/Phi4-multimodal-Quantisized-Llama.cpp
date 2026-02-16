@@ -185,6 +185,7 @@ llama.cpp/
 
 - [Phi-4 multimodal (Microsoft)](https://huggingface.co/microsoft/Phi-4-multimodal-instruct)
 - [Phi-4 technical report](https://arxiv.org/abs/2503.01743)
+- [GGUF weights for this fork (Hugging Face)](https://huggingface.co/ShayanCyan/phi4-multimodal-quantisized-gguf)
 - [llama.cpp build docs](docs/build.md)
 - [Multimodal / mtmd](tools/mtmd/README.md)
 - [Server options](tools/server/README.md)
